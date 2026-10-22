@@ -25,6 +25,10 @@ internal static class Native
     public const uint WINEVENT_OUTOFCONTEXT = 0x0000;
     public const uint WINEVENT_SKIPOWNPROCESS = 0x0002;
 
+    public const int HSHELL_WINDOWCREATED = 1;
+    public const int HSHELL_WINDOWDESTROYED = 2;
+    public const int HSHELL_WINDOWREPLACED = 13;
+
     public const uint ABM_NEW = 0x0000;
     public const uint ABM_REMOVE = 0x0001;
     public const int ABN_POSCHANGED = 0x0001;
@@ -151,6 +155,14 @@ internal static class Native
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern uint RegisterWindowMessage(string message);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool RegisterShellHookWindow(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool DeregisterShellHookWindow(IntPtr hwnd);
 
     [DllImport("user32.dll")]
     public static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr module, WinEventDelegate callback, uint processId, uint threadId, uint flags);

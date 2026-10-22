@@ -20,6 +20,14 @@ internal sealed class WidgetForm : Form
     private readonly System.Windows.Forms.Timer _progressTimer = new();
     private readonly System.Windows.Forms.Timer _marqueeTimer = new();
     private readonly System.Windows.Forms.Timer _anchorTimer = new() { Interval = 60_000 };
+    // The taskbar animates its icons: an added button settles within ~300 ms; a removed one only starts moving after
+    // ~500 ms and settles by ~800 ms (before it moves, UI Automation briefly reports the final position, then the old
+    // one again, so don't look early). Re-check through that window (gaps in ms) so the widget follows the icons.
+    private static readonly int[] ButtonAddedSteps = [120, 150, 200, 250, 300, 300];
+    private static readonly int[] ButtonRemovedSteps = [550, 150, 150, 200, 300];
+    private readonly System.Windows.Forms.Timer _taskbarSettleTimer = new();
+    private int[] _taskbarSettleSteps = ButtonAddedSteps;
+    private int _taskbarSettleStep, _anchorRequest;
     private readonly System.Windows.Forms.Timer _topmostTimer = new() { Interval = 100 };
     private readonly NotifyIcon _tray = new();
     private readonly VolumeFlyout _volumeFlyout;
@@ -29,11 +37,23 @@ internal sealed class WidgetForm : Form
 
     private Native.WinEventDelegate? _winEventProc;
     private IntPtr _winEventHook;
-    private uint _taskbarCreatedMessage;
+    private uint _taskbarCreatedMessage, _shellHookMessage;
     private bool _fullscreen;
     private TaskbarAnchors _anchors;
     private TaskbarEdge _edge;
     private ToolTip? _toolTip;
+
+    // Horizontal layout sizes, in logical pixels.
+    private const int Pad = 6, ArtSize = 32, ButtonSize = 32, ButtonGap = 2, TextGap = 8, ButtonsGap = 6;
+    private const int FullTextWidth = 150, NarrowestTextWidth = 80;
+
+    // The title column (including its gap to the art) glides to a new width when the space beside the taskbar
+    // icons changes.
+    private const float ResizeMs = 250;
+    private readonly System.Windows.Forms.Timer _resizeTimer = new() { Interval = 16 };
+    private int _textSlot, _textSlotFrom, _textSlotTo, _settledTextWidth = -1;
+    private DateTime _resizeStart;
+    private bool _shuffleRepeat;
 
     private enum LyricsState { Off, Loading, Ready, NotFound, Unavailable }
     // Show each line a touch early; it reads as better synced than switching exactly on the timestamp.
@@ -107,6 +127,8 @@ internal sealed class WidgetForm : Form
         _marqueeTimer.Tick += OnMarqueeTick;
         // The weather widget resizes as its text changes, so re-check where it ends now and then.
         _anchorTimer.Tick += (_, _) => RefreshTaskbarAnchors();
+        _taskbarSettleTimer.Tick += OnTaskbarSettleTick;
+        _resizeTimer.Tick += OnResizeTick;
         _topmostTimer.Tick += (_, _) =>
         {
             if (!IsTaskbar(Native.GetForegroundWindow()))
@@ -147,6 +169,9 @@ internal sealed class WidgetForm : Form
         // Registering as an (zero-size) app bar gets us shell notifications for fullscreen apps and taskbar moves.
         RegisterAppBar();
         _taskbarCreatedMessage = Native.RegisterWindowMessage("TaskbarCreated");
+        // Taskbar buttons appearing or disappearing shift the centred icons; the shell hook tells us when.
+        _shellHookMessage = Native.RegisterWindowMessage("SHELLHOOK");
+        Native.RegisterShellHookWindow(Handle);
 
         // The taskbar pushes itself above us when it's clicked; re-assert topmost when the foreground changes.
         _winEventProc = OnForegroundChanged;
@@ -179,6 +204,7 @@ internal sealed class WidgetForm : Form
     {
         if (_winEventHook != IntPtr.Zero)
             Native.UnhookWinEvent(_winEventHook);
+        Native.DeregisterShellHookWindow(Handle);
         UnregisterAppBar();
         base.OnHandleDestroyed(e);
     }
@@ -199,6 +225,8 @@ internal sealed class WidgetForm : Form
             _progressTimer.Dispose();
             _marqueeTimer.Dispose();
             _anchorTimer.Dispose();
+            _taskbarSettleTimer.Dispose();
+            _resizeTimer.Dispose();
             _topmostTimer.Dispose();
             _themeTimer.Dispose();
             _lyricsTimer.Dispose();
@@ -263,7 +291,14 @@ internal sealed class WidgetForm : Form
                 break;
 
             default:
-                if (_taskbarCreatedMessage != 0 && m.Msg == (int)_taskbarCreatedMessage)
+                if (_shellHookMessage != 0 && m.Msg == (int)_shellHookMessage)
+                {
+                    if ((int)m.WParam is Native.HSHELL_WINDOWCREATED or Native.HSHELL_WINDOWREPLACED)
+                        OnTaskbarButtonsChanged(removed: false);
+                    else if ((int)m.WParam == Native.HSHELL_WINDOWDESTROYED)
+                        OnTaskbarButtonsChanged(removed: true);
+                }
+                else if (_taskbarCreatedMessage != 0 && m.Msg == (int)_taskbarCreatedMessage)
                 {
                     UnregisterAppBar();
                     RegisterAppBar();
@@ -283,15 +318,35 @@ internal sealed class WidgetForm : Form
     private void BuildLayout()
     {
         _scale = DeviceDpi / 96f;
-        int pad = S(6), art = S(32), button = S(32), gap = S(2);
-        int width, height;
+        _resizeTimer.Stop();
+        (_textSlotTo, _shuffleRepeat) = IsVertical ? (0, _settings.ShowShuffleRepeat) : FitToTaskbar();
+        _textSlot = _textSlotTo;
 
+        _titleFont?.Dispose();
+        _artistFont?.Dispose();
+        _iconFont?.Dispose();
+        _titleFont = new Font("Segoe UI Semibold", 13 * _scale, GraphicsUnit.Pixel);
+        _artistFont = new Font("Segoe UI", 12 * _scale, GraphicsUnit.Pixel);
+        _iconFont = new Font(_iconFamily, 16 * _scale, GraphicsUnit.Pixel);
+        _media.ArtSize = S(ArtSize);
+        MeasureTitle();
+
+        ApplyLayout();
+        OnTextColumnSettled();
+        UpdateProgressTimer();
+    }
+
+    private static List<Btn> ButtonOrder(bool shuffleRepeat) => shuffleRepeat
+        ? [Btn.Shuffle, Btn.Previous, Btn.PlayPause, Btn.Next, Btn.Repeat, Btn.Volume]
+        : [Btn.Previous, Btn.PlayPause, Btn.Next, Btn.Volume];
+
+    /// <summary>Lays everything out for the current title column width and moves/resizes the window to match.</summary>
+    private void ApplyLayout()
+    {
+        int pad = S(Pad), art = S(ArtSize), button = S(ButtonSize), gap = S(ButtonGap);
+        int width, height;
+        var order = ButtonOrder(_shuffleRepeat);
         _buttons.Clear();
-        var order = new List<Btn>();
-        if (_settings.ShowShuffleRepeat) order.Add(Btn.Shuffle);
-        order.AddRange([Btn.Previous, Btn.PlayPause, Btn.Next]);
-        if (_settings.ShowShuffleRepeat) order.Add(Btn.Repeat);
-        order.Add(Btn.Volume);
 
         if (IsVertical)
         {
@@ -316,11 +371,18 @@ internal sealed class WidgetForm : Form
         {
             height = S(44);
             _artRect = new Rectangle(pad, (height - art) / 2 - S(1), art, art);
-            int textX = _artRect.Right + S(8), textWidth = S(150);
-            _titleRect = new Rectangle(textX, _artRect.Top - S(1), textWidth, S(18));
-            _artistRect = new Rectangle(textX, _artRect.Top + S(16), textWidth, S(17));
+            int textX = _artRect.Right + S(TextGap), textWidth = _textSlot - S(TextGap);
+            if (textWidth > 0)
+            {
+                _titleRect = new Rectangle(textX, _artRect.Top - S(1), textWidth, S(18));
+                _artistRect = new Rectangle(textX, _artRect.Top + S(16), textWidth, S(17));
+            }
+            else
+            {
+                _titleRect = _artistRect = Rectangle.Empty;
+            }
 
-            int x = textX + textWidth + S(6);
+            int x = _artRect.Right + _textSlot + S(ButtonsGap);
             foreach (var id in order)
             {
                 _buttons.Add((id, new Rectangle(x, _artRect.Top, button, button)));
@@ -332,26 +394,70 @@ internal sealed class WidgetForm : Form
             _progressArea = Rectangle.FromLTRB(0, height - S(11), width, height);
         }
 
-        _titleFont?.Dispose();
-        _artistFont?.Dispose();
-        _iconFont?.Dispose();
-        _titleFont = new Font("Segoe UI Semibold", 13 * _scale, GraphicsUnit.Pixel);
-        _artistFont = new Font("Segoe UI", 12 * _scale, GraphicsUnit.Pixel);
-        _iconFont = new Font(_iconFamily, 16 * _scale, GraphicsUnit.Pixel);
-
-        _media.ArtSize = art;
-        Size = new Size(width, height);
-        MeasureTitle();
-        UpdateToolTip();
-        if (!_dragging)
-            Reposition();
-        UpdateProgressTimer();
+        var size = new Size(width, height);
+        // Move and resize in one step so a right-docked widget doesn't briefly stick out over its neighbours.
+        if (IsHandleCreated && !_dragging)
+            Bounds = new Rectangle(DockLocation(size), size);
+        else
+            Size = size;
         Invalidate();
+    }
+
+    /// <summary>
+    /// How much of the horizontal widget fits beside the taskbar icons when docked: the full title column, a
+    /// narrower one, none (the title moves to a tooltip), and finally no shuffle/repeat either. The column width
+    /// includes its gap to the art, so it can animate smoothly down to 0.
+    /// </summary>
+    private (int TextSlot, bool ShuffleRepeat) FitToTaskbar()
+    {
+        int full = S(TextGap) + S(FullTextWidth);
+        bool shuffleRepeat = _settings.ShowShuffleRepeat;
+        if (!_settings.SnapToTaskbar || TaskbarInfo.Bounds is not { } taskbar)
+            return (full, shuffleRepeat);
+
+        var (begin, end, _) = DockSpan(taskbar);
+        int room = end - begin, buttons = ButtonOrder(shuffleRepeat).Count;
+        int compact = S(Pad) + S(ArtSize) + S(ButtonsGap) + buttons * S(ButtonSize) + (buttons - 1) * S(ButtonGap) + S(Pad);
+        int slot = Math.Min(full, room - compact);
+        if (slot >= S(TextGap) + S(NarrowestTextWidth))
+            return (slot, shuffleRepeat);
+        return (0, shuffleRepeat && room >= compact);
+    }
+
+    private void AnimateTextSlot(int target)
+    {
+        _textSlotFrom = _textSlot;
+        _textSlotTo = target;
+        _resizeStart = DateTime.UtcNow;
+        _resizeTimer.Start();
+    }
+
+    private void OnResizeTick(object? sender, EventArgs e)
+    {
+        float t = Math.Clamp((float)(DateTime.UtcNow - _resizeStart).TotalMilliseconds / ResizeMs, 0f, 1f);
+        float eased = 1 - (1 - t) * (1 - t) * (1 - t);
+        _textSlot = (int)MathF.Round(_textSlotFrom + (_textSlotTo - _textSlotFrom) * eased);
+        if (t >= 1)
+            _resizeTimer.Stop();
+        ApplyLayout();
+        if (t >= 1)
+            OnTextColumnSettled();
+    }
+
+    // Scrolling and the tooltip depend on the column width; update them once it stops changing, not every frame.
+    private void OnTextColumnSettled()
+    {
+        UpdateToolTip();
+        if (_titleRect.Width == _settledTextWidth)
+            return;
+        _settledTextWidth = _titleRect.Width;
+        RestartMarquee();
+        StartLyricScroll();
     }
 
     private void UpdateToolTip()
     {
-        if (!IsVertical)
+        if (_titleRect.Width > 0)
         {
             _toolTip?.SetToolTip(this, null);
             return;
@@ -363,26 +469,39 @@ internal sealed class WidgetForm : Form
 
     private void Reposition()
     {
-        if (!IsHandleCreated || _dragging)
-            return;
+        if (IsHandleCreated && !_dragging)
+            Location = DockLocation(Size);
+    }
 
+    private Point DockLocation(Size size)
+    {
         if (!_settings.SnapToTaskbar)
         {
-            var saved = new Rectangle(_settings.X, _settings.Y, Width, Height);
+            var saved = new Rectangle(_settings.X, _settings.Y, size.Width, size.Height);
             if (Screen.AllScreens.Any(s => s.Bounds.IntersectsWith(saved)))
-            {
-                Location = saved.Location;
-                return;
-            }
+                return saved.Location;
         }
 
         if (TaskbarInfo.Bounds is not { } taskbar)
         {
             var area = Screen.PrimaryScreen?.WorkingArea ?? Rectangle.Empty;
-            Location = new Point(area.Left + S(8), area.Bottom - Height - S(8));
-            return;
+            return new Point(area.Left + S(8), area.Bottom - size.Height - S(8));
         }
 
+        var (begin, end, atEnd) = DockSpan(taskbar);
+        int position = atEnd ? end - (IsVertical ? size.Height : size.Width) : begin;
+        return IsVertical
+            ? new Point(taskbar.Left + (taskbar.Width - size.Width) / 2, position)
+            : new Point(position, taskbar.Top + (taskbar.Height - size.Height) / 2);
+    }
+
+    /// <summary>
+    /// The free stretch of the taskbar (along its long axis, margins included) on the side the widget docks to:
+    /// from the screen edge or Widgets button up to the Start/app icons, or from the icons up to the tray.
+    /// <c>AtEnd</c> is true when the widget hugs the far end of that stretch.
+    /// </summary>
+    private (int Begin, int End, bool AtEnd) DockSpan(Rectangle taskbar)
+    {
         // Work along the taskbar's long axis so the same logic covers horizontal and vertical taskbars.
         bool vertical = IsVertical;
         int Near(Rectangle r) => vertical ? r.Top : r.Left;
@@ -390,42 +509,41 @@ internal sealed class WidgetForm : Form
         Rectangle? Inside(Rectangle? r) => r is { } v && v.IntersectsWith(taskbar) ? v : null;
 
         int axisStart = Near(taskbar), axisEnd = Far(taskbar), middle = (axisStart + axisEnd) / 2;
-        int length = vertical ? Height : Width;
+        int margin = S(8);
         var widgets = Inside(_anchors.Widgets);
-        var start = Inside(_anchors.Start);
+        var apps = Inside(_anchors.Apps);
         var tray = Inside(_anchors.Tray);
 
         // With left- or top-aligned icons, Start sits at the beginning, so that end is taken.
-        bool startSideTaken = start is { } s && Near(s) - axisStart < (axisEnd - axisStart) / 4;
-
-        int position;
-        if (_settings.DockRight || startSideTaken)
+        if (_settings.DockRight || _anchors.IconsAtStart)
         {
             int end = axisEnd;
             if (tray is { } t && Near(t) > middle)
                 end = Math.Min(end, Near(t));
             if (widgets is { } w && Near(w) > middle)
                 end = Math.Min(end, Near(w));
-            position = end - length - S(8);
+            int begin = apps is { } a ? Far(a) : axisStart;
+            return (begin + margin, end - margin, true);
         }
         else
         {
             int begin = axisStart;
             if (widgets is { } w && Far(w) < middle)
                 begin = Math.Max(begin, Far(w));
-            position = begin + S(8);
+            int end = apps is { } a ? Near(a) : axisEnd;
+            return (begin + margin, end - margin, false);
         }
-
-        Location = vertical
-            ? new Point(taskbar.Left + (taskbar.Width - Width) / 2, position)
-            : new Point(position, taskbar.Top + (taskbar.Height - Height) / 2);
     }
 
     private async void RefreshTaskbarAnchors()
     {
         if (_settings.SnapToTaskbar)
         {
-            _anchors = await Task.Run(TaskbarInfo.FindAnchors);
+            int request = ++_anchorRequest;
+            var anchors = await Task.Run(TaskbarInfo.FindAnchors);
+            if (request != _anchorRequest)
+                return;
+            _anchors = anchors;
             _anchorTimer.Start();
         }
         else
@@ -438,11 +556,54 @@ internal sealed class WidgetForm : Form
         {
             _edge = edge;
             BuildLayout();
+            return;
+        }
+        if (!IsVertical)
+        {
+            var (slot, shuffleRepeat) = FitToTaskbar();
+            if (shuffleRepeat != _shuffleRepeat)
+            {
+                BuildLayout();
+                return;
+            }
+            if (slot != _textSlotTo)
+            {
+                AnimateTextSlot(slot);
+                return;
+            }
+        }
+        Reposition();
+    }
+
+    private void OnTaskbarButtonsChanged(bool removed)
+    {
+        if (!_settings.SnapToTaskbar)
+            return;
+        _taskbarSettleStep = 0;
+        if (removed)
+        {
+            _taskbarSettleSteps = ButtonRemovedSteps;
+            _taskbarSettleTimer.Stop();
+        }
+        else if (_taskbarSettleTimer.Enabled)
+        {
+            return;
         }
         else
         {
-            Reposition();
+            _taskbarSettleSteps = ButtonAddedSteps;
         }
+        _taskbarSettleTimer.Interval = _taskbarSettleSteps[0];
+        _taskbarSettleTimer.Start();
+    }
+
+    private void OnTaskbarSettleTick(object? sender, EventArgs e)
+    {
+        RefreshTaskbarAnchors();
+        if (++_taskbarSettleStep < _taskbarSettleSteps.Length)
+            _taskbarSettleTimer.Interval = _taskbarSettleSteps[_taskbarSettleStep];
+        else
+            _taskbarSettleTimer.Stop();
     }
 
     private void AssertTopmost()
@@ -912,7 +1073,14 @@ internal sealed class WidgetForm : Form
         string title = DisplayTitle;
         var state = g.Save();
         g.SetClip(_titleRect);
-        if (!_marqueeScrolling)
+        bool resizing = _resizeTimer.Enabled;
+        if (resizing && !_marqueeScrolling)
+        {
+            // While the column resizes, cut text off with a fade; an ellipsis would jump around on every frame.
+            TextRenderer.DrawText(g, title, _titleFont, _titleRect with { Width = short.MaxValue }, _theme.Foreground, TextFlags);
+            DrawEdgeFades(g, _titleRect, left: false, right: true);
+        }
+        else if (!_marqueeScrolling)
         {
             TextRenderer.DrawText(g, title, _titleFont, _titleRect, _theme.Foreground, TextFlags | TextFormatFlags.EndEllipsis);
         }
@@ -943,8 +1111,17 @@ internal sealed class WidgetForm : Form
         string subtitle = SeekActive
             ? $"{FormatTime(_media.Duration * SeekFraction(_seekX))} / {FormatTime(_media.Duration)}"
             : lyric ?? _media.Artist;
-        TextRenderer.DrawText(g, subtitle, _artistFont, _artistRect, lyric is null ? _theme.ForegroundDim : _theme.Accent,
-            TextFlags | TextFormatFlags.EndEllipsis);
+        var color = lyric is null ? _theme.ForegroundDim : _theme.Accent;
+        if (resizing)
+        {
+            var subtitleState = g.Save();
+            g.SetClip(_artistRect);
+            TextRenderer.DrawText(g, subtitle, _artistFont, _artistRect with { Width = short.MaxValue }, color, TextFlags);
+            DrawEdgeFades(g, _artistRect, left: false, right: true);
+            g.Restore(subtitleState);
+            return;
+        }
+        TextRenderer.DrawText(g, subtitle, _artistFont, _artistRect, color, TextFlags | TextFormatFlags.EndEllipsis);
     }
 
     /// <summary>
