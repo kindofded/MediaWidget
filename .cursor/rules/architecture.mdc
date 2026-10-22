@@ -1,0 +1,28 @@
+---
+description: What MediaWidget is, how it's structured, and how it behaves
+alwaysApply: true
+---
+
+# MediaWidget architecture
+
+A lightweight Windows 11 taskbar media widget (replacement for a heavy third-party one).
+C# / WinForms / .NET 10 (`net10.0-windows10.0.19041.0`), custom-painted, no designer files.
+**Primary goal: minimal CPU and RAM.** Event-driven; idle CPU ~0%, ~20 MB private memory. Keep it that way.
+
+## Files
+- `Program.cs` – single-instance mutex, global error logging, loop that recreates the widget if Explorer destroys it.
+- `WidgetForm.cs` – the widget: layout (horizontal, or vertical column for left/right taskbars), painting, input, taskbar docking, native menu, lyrics line, album-colour theming.
+- `MediaController.cs` – Windows Global System Media Transport Controls (GSMTC): current session, title/artist/art, playback/timeline, commands, album colour extraction. All events marshalled to the UI thread.
+- `AudioVolume.cs` – `IVolumeControl`: per-app volume (Core Audio sessions matched to the playing app's AUMID) with system-volume fallback. Hand-written COM interop (`CoreAudio`).
+- `TaskbarInfo.cs` – taskbar edge, and UI Automation lookup of Widgets (weather) button, Start button and tray so the widget doesn't cover them.
+- `Theme.cs` – light/dark colours, album tinting (`Tinted`), cross-fade (`Lerp`), `ColorMath` (HSL, WCAG contrast, dominant cover colour).
+- `VolumeFlyout.cs`, `LyricsCard.cs` – popups. `PopupMenu.cs` – native Win32 menu (Win11 styling + dark mode). `Drawing.cs` – rounded rects, grayscale glyph drawing. `Native.cs` – P/Invoke. `Settings.cs` – registry settings (`HKCU\Software\MediaWidget`) and Start-with-Windows (`HKCU\...\Run`).
+- `LyricsService.cs` – synced lyrics from LRCLIB (`https://lrclib.net/api/search`), LRC parsing, session cache.
+
+## Key behaviours (don't regress)
+- Window is `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE`, topmost, and **owned by `Shell_TrayWnd`** (`AttachToTaskbar`, re-applied in `OnVisibleChanged` because WinForms resets the owner). This is what stops flicker and hiding behind the taskbar/Search.
+- Registers a zero-size AppBar to get `ABN_FULLSCREENAPP` (hide in fullscreen) and `ABN_POSCHANGED`; handles `TaskbarCreated`, `WM_SETTINGCHANGE`, `WM_DISPLAYCHANGE`.
+- Timers only run when needed: progress (≤4 Hz, only while playing), title marquee, lyric line scroll, lyric line changes (one-shot per line), theme fade (400 ms), anchors refresh (60 s, UIA off the UI thread), topmost check (only while taskbar is foreground).
+- Song-change detection uses `_announcedText` in `MediaController` (players send two quick updates per track; don't compare against the `Title` property).
+- Lyrics: off by default; inline line in accent colour with timed scroll + edge fades; card shows ±3 lines and seeks on click; retries network errors 3×; failures logged.
+- Unexpected exceptions never show a dialog: logged to `%LOCALAPPDATA%\MediaWidget\errors.log` (lyrics failures to `lyrics.log`).

@@ -1,0 +1,14 @@
+# Build output
+bin/
+obj/
+publish/
+share/
+*.zip
+
+# Personal agent context (environment details, task state) – not for the public repo
+.cursor/rules/local-context.mdc
+
+# IDE
+.vs/
+.vscode/
+*.user

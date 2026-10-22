@@ -1,0 +1,33 @@
+---
+description: Coding conventions, build/run, and how to verify changes in MediaWidget
+alwaysApply: true
+---
+
+# Conventions
+
+- Sizes: always scale logical pixels with `S(...)` (DPI-aware, PerMonitorV2). Never hardcode device pixels.
+- Colours: always from the current `Theme` (`_theme`); never hardcode. Text colours derived from album/system colours must go through `ColorMath.EnsureContrast` (target `MinTextContrast` = 6:1).
+- Text: `TextRenderer` (ClearType). Icon-font glyphs: `Drawing.Glyph` (grayscale; ClearType gives colour fringes). Play/pause/prev/next are vector shapes (`DrawTransportGlyph`).
+- Invalidate only the rectangles that changed; skip drawing parts outside `e.ClipRectangle`.
+- New setting: add property + `Load` + `Save` in `Settings.cs`, then a menu item in `ShowMenu` (native `PopupMenu`, saved after the menu closes).
+- No public properties on Forms (WinForms analyzer WFO1000 fails the build) – use methods like `SetTheme(...)`.
+- COM interop: `[ComImport]` interfaces must declare every vtable slot in order (placeholder methods for unused ones). Release COM objects you don't keep.
+- UI Automation and network calls never block the UI thread.
+- Comments only for constraints the code can't show (Windows quirks, why a workaround exists). Match surrounding style.
+
+# Build & run (from the repo root)
+
+```powershell
+dotnet run -c Release          # dev loop
+dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish   # the exe you actually run
+```
+
+- Only one instance can run (mutex). If the widget is running, `dotnet run` exits silently and `publish` fails (exe locked): `Get-Process MediaWidget | Stop-Process` first, then relaunch `publish\MediaWidget.exe`.
+- After building, run `dotnet build-server shutdown` (the compiler server otherwise sits at ~280 MB).
+- Shareable self-contained build: add `--self-contained true -p:EnableCompressionInSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=none -o share`.
+
+# Verifying changes
+
+- Screenshot just the widget: find the window titled `Media Widget` (cards: `Media Widget Lyrics`, `Media Widget Volume`) and `PrintWindow(hwnd, hdc, 2)` from PowerShell; scale ×2–3 with nearest-neighbour to inspect.
+- Test logic without waiting for real songs: a throwaway console project in `%TEMP%` that `<Compile Include>`s the real source files (e.g. `Theme.cs`, `Native.cs`, `LyricsService.cs`) – test real code, not copies.
+- Resource usage: sample `(Get-Process MediaWidget).TotalProcessorTime` in 2 s slices over 60 s plus `PrivateMemorySize64`. Report CPU as % of one core and of the whole CPU.
