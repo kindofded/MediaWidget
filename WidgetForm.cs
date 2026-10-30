@@ -29,6 +29,7 @@ internal sealed class WidgetForm : Form
     private int[] _taskbarSettleSteps = ButtonAddedSteps;
     private int _taskbarSettleStep, _anchorRequest;
     private readonly System.Windows.Forms.Timer _topmostTimer = new() { Interval = 100 };
+    private readonly System.Windows.Forms.Timer _bandCheckTimer = new() { Interval = 600 };
     private readonly NotifyIcon _tray = new();
     private readonly VolumeFlyout _volumeFlyout;
     private readonly List<(Btn Id, Rectangle Bounds)> _buttons = [];
@@ -126,7 +127,17 @@ internal sealed class WidgetForm : Form
         _progressTimer.Tick += (_, _) => InvalidateProgress();
         _marqueeTimer.Tick += OnMarqueeTick;
         // The weather widget resizes as its text changes, so re-check where it ends now and then.
-        _anchorTimer.Tick += (_, _) => RefreshTaskbarAnchors();
+        _anchorTimer.Tick += (_, _) =>
+        {
+            RecoverIfStranded();
+            RefreshTaskbarAnchors();
+        };
+        _bandCheckTimer.Tick += (_, _) =>
+        {
+            _bandCheckTimer.Stop();
+            RecoverIfStranded();
+            AttachToTaskbar();
+        };
         _taskbarSettleTimer.Tick += OnTaskbarSettleTick;
         _resizeTimer.Tick += OnResizeTick;
         _topmostTimer.Tick += (_, _) =>
@@ -228,6 +239,7 @@ internal sealed class WidgetForm : Form
             _taskbarSettleTimer.Dispose();
             _resizeTimer.Dispose();
             _topmostTimer.Dispose();
+            _bandCheckTimer.Dispose();
             _themeTimer.Dispose();
             _lyricsTimer.Dispose();
             _lyricScrollTimer.Dispose();
@@ -263,6 +275,11 @@ internal sealed class WidgetForm : Form
         {
             case Native.WM_MOUSEACTIVATE:
                 m.Result = Native.MA_NOACTIVATE;
+                return;
+
+            case Native.WM_INPUTLANGCHANGE:
+                // WinForms looks up the new keyboard layout's culture here, which throws with InvariantGlobalization.
+                DefWndProc(ref m);
                 return;
 
             case AppBarMessage:
@@ -636,6 +653,10 @@ internal sealed class WidgetForm : Form
 
     private void OnForegroundChanged(IntPtr hook, uint eventType, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
     {
+        // Start/Search closing changes the foreground; Explorer lowers the taskbar again shortly after.
+        _bandCheckTimer.Stop();
+        _bandCheckTimer.Start();
+
         // Leave Start, Search and other shell flyouts on top of us.
         if (GetClass(hwnd) is "Windows.UI.Core.CoreWindow" or "Xaml_WindowedPopupClass")
             return;
@@ -655,8 +676,29 @@ internal sealed class WidgetForm : Form
     private void AttachToTaskbar()
     {
         var taskbar = TaskbarInfo.Handle;
-        if (taskbar != IntPtr.Zero && Native.GetWindow(Handle, Native.GW_OWNER) != taskbar)
+        // While Start or Search is open we're raised along with the taskbar and GW_OWNER reads as none. Re-owning
+        // then strands us in the raised band after they close (no menus or hover), so wait until we're back.
+        if (taskbar != IntPtr.Zero && IsInDesktopBand(Handle) && Native.GetWindow(Handle, Native.GW_OWNER) != taskbar)
             Native.SetWindowLongPtr(Handle, Native.GWLP_HWNDPARENT, taskbar);
+    }
+
+    private static bool IsInDesktopBand(IntPtr hwnd) =>
+        !Native.GetWindowBand(hwnd, out uint band) || band == Native.ZBID_DESKTOP;
+
+    /// <summary>
+    /// If we were left in the raised band after the taskbar went back down, Windows won't let us be re-owned or
+    /// show menus. A new window starts in the normal band, so recreate ours.
+    /// </summary>
+    private void RecoverIfStranded()
+    {
+        var taskbar = TaskbarInfo.Handle;
+        if (!Visible || taskbar == IntPtr.Zero || IsInDesktopBand(Handle) || !IsInDesktopBand(taskbar))
+            return;
+        // The lyrics card is owned by this window and would be destroyed with it.
+        _lyricsCard?.Dispose();
+        _lyricsCard = null;
+        RecreateHandle();
+        AssertTopmost();
     }
 
     private bool IsTaskbar(IntPtr hwnd) => GetClass(hwnd) is "Shell_TrayWnd" or "Shell_SecondaryTrayWnd";

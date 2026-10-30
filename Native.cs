@@ -140,6 +140,16 @@ internal static class Native
     [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
     public static extern IntPtr SetWindowLongPtr(IntPtr hwnd, int index, IntPtr value);
 
+    // Undocumented: which z-order band a window is in. Normal windows are in ZBID_DESKTOP; Explorer moves the
+    // taskbar (and windows it owns) to a higher band while Start or Search is open.
+    public const uint ZBID_DESKTOP = 1;
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool GetWindowBand(IntPtr hwnd, out uint band);
+
+    public const int WM_INPUTLANGCHANGE = 0x0051;
+
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
